@@ -1,0 +1,29 @@
+# ── Angel One SmartAPI ────────────────────
+smartapi-python==1.4.2
+websocket-client==1.8.0
+
+# ── TOTP / Authentication ─────────────────
+pyotp==2.9.0
+
+# ── Data & Analysis ───────────────────────
+pandas==2.2.2
+numpy==1.26.4
+pandas-ta==0.3.14b          # Technical indicators: RSI, EMA, Supertrend, VWAP
+
+# ── HTTP / Networking ─────────────────────
+requests==2.32.3
+
+# ── Database ──────────────────────────────
+sqlalchemy==2.0.30
+
+# ── Logging ───────────────────────────────
+loguru==0.7.2
+
+# ── Scheduling (market hours check) ───────
+schedule==1.2.2
+
+# ── Dashboard (lightweight HTTP server) ───
+flask==3.0.3
+
+# ── Environment variables ─────────────────
+python-dotenv==1.0.1

@@ -1,0 +1,91 @@
+version: "3.9"
+
+services:
+
+  # ─────────────────────────────────────────
+  # Main Trading Bot
+  # ─────────────────────────────────────────
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nifty_bot
+    restart: unless-stopped          # Auto-restart on crash, stop on manual down
+    env_file:
+      - .env                         # Secrets loaded from .env file
+    environment:
+      - TZ=Asia/Kolkata              # IST timezone — critical for market hours
+      - TRADING_MODE=${TRADING_MODE:-paper}   # paper | live
+    volumes:
+      - bot_data:/app/data           # Persistent SQLite DB (trades.db)
+      - bot_logs:/app/logs           # Persistent logs
+    depends_on:
+      - dashboard
+    networks:
+      - botnet
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ─────────────────────────────────────────
+  # Paper Trade Dashboard (Lightweight Web UI)
+  # ─────────────────────────────────────────
+  dashboard:
+    image: python:3.11-slim
+    container_name: nifty_dashboard
+    working_dir: /app
+    command: python dashboard.py
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Kolkata
+    volumes:
+      - .:/app
+      - bot_data:/app/data
+      - bot_logs:/app/logs
+    ports:
+      - "8080:8080"                  # Open http://localhost:8080 to view P&L
+    networks:
+      - botnet
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # CLI — Run one-off commands inside the bot
+  # ─────────────────────────────────────────
+  cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nifty_cli
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Kolkata
+      - TRADING_MODE=${TRADING_MODE:-paper}
+    volumes:
+      - bot_data:/app/data
+      - bot_logs:/app/logs
+      - .:/app                       # Mount source for dev/debugging
+    networks:
+      - botnet
+    profiles:
+      - tools                        # Only starts when explicitly called
+    entrypoint: ["python"]           # e.g: podman compose run cli report.py
+
+# ─────────────────────────────────────────
+# Named Volumes — data persists across restarts
+# ─────────────────────────────────────────
+volumes:
+  bot_data:
+    driver: local
+  bot_logs:
+    driver: local
+
+# ─────────────────────────────────────────
+# Internal network — services talk privately
+# ─────────────────────────────────────────
+networks:
+  botnet:
+    driver: bridge

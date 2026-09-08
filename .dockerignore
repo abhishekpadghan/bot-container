@@ -1,0 +1,45 @@
+# ── Python ───────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual Environments ─────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Secrets — NEVER copy into image ──────
+.env
+*.key
+*.pem
+secrets/
+
+# ── Data & Logs — use volumes instead ────
+data/
+logs/
+*.db
+*.sqlite
+*.sqlite3
+
+# ── IDE / OS ──────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Git ───────────────────────────────────
+.git/
+.gitignore
+
+# ── Docs ──────────────────────────────────
+*.md
+docs/
