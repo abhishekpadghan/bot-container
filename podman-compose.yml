@@ -33,16 +33,16 @@ services:
   # Paper Trade Dashboard (Lightweight Web UI)
   # ─────────────────────────────────────────
   dashboard:
-    image: python:3.11-slim
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: nifty_dashboard
-    working_dir: /app
-    command: python dashboard.py
+    command: ["python", "dashboard.py"]
     env_file:
       - .env
     environment:
       - TZ=Asia/Kolkata
     volumes:
-      - .:/app
       - bot_data:/app/data
       - bot_logs:/app/logs
     ports:
