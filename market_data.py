@@ -176,3 +176,52 @@ def build_option_symbol(
     Returns: "NIFTY23SEP1985CE"  (example)
     """
     return f"{underlying}{expiry}{strike}{option_type}"
+
+
+# ── BLOCKER 5 FIX: OI Liquidity check ────────────────────────
+
+MIN_OI_THRESHOLD = 100_000   # minimum Open Interest to consider a strike liquid
+
+def check_liquidity(symbol: str, token: str, exchange: str = NSE_FO) -> tuple[bool, str]:
+    """
+    Check if an option strike has sufficient Open Interest for safe trading.
+
+    Low OI = wide bid-ask spread = guaranteed slippage loss at entry.
+    Minimum threshold: 100,000 OI (configurable via MIN_OI env var).
+
+    Returns:
+        (True, "")           — liquid, safe to trade
+        (False, reason)      — illiquid, skip this strike
+    """
+    import os
+    min_oi = int(os.getenv("MIN_OI_THRESHOLD", str(MIN_OI_THRESHOLD)))
+
+    try:
+        smart = auth.get_session()
+        resp  = smart.ltpData(exchange=exchange, tradingsymbol=symbol, symboltoken=token)
+        if not resp.get("status"):
+            # Can't verify — allow trade but warn
+            logger.warning(f"Liquidity check failed for {symbol} — proceeding anyway")
+            return True, ""
+
+        data = resp.get("data", {})
+
+        # Angel One LTP response includes OI field
+        oi = int(data.get("opninterest", 0) or data.get("oi", 0) or 0)
+
+        if oi == 0:
+            # OI not returned in LTP — try market depth
+            logger.debug(f"OI not in LTP for {symbol} — skipping liquidity gate")
+            return True, ""
+
+        if oi < min_oi:
+            reason = f"Low OI={oi:,} < {min_oi:,} — spread risk too high"
+            logger.warning(f"⚠️ {symbol} ILLIQUID: {reason}")
+            return False, reason
+
+        logger.debug(f"✅ {symbol} liquid: OI={oi:,}")
+        return True, ""
+
+    except Exception as exc:
+        logger.warning(f"Liquidity check exception: {exc} — allowing trade")
+        return True, ""

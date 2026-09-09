@@ -1,33 +1,36 @@
 """
-main.py — NiftyBot entry point.
+main.py — NiftyBot orchestrator (Production-grade).
 
-Main loop flow:
-  1. Login to Angel One SmartAPI
-  2. Every POLL_INTERVAL seconds (default 30s):
-     a. Check if within trading hours
-     b. Fetch live Nifty candles + India VIX
-     c. If FLAT: run strategy → enter if signal is BUY
-     d. If IN_TRADE: check exit conditions → exit if triggered
-     e. Force-exit all positions at EXIT_ALL_TIME
-  3. Log out cleanly on shutdown
+Full loop:
+  1. Login via SessionManager (auto-reconnect, heartbeat)
+  2. Every POLL_INTERVAL seconds:
+     a. Check market hours + risk gates + blackout dates
+     b. Fetch 5-min + 1-min Nifty candles + India VIX
+     c. Fetch option chain (PCR, OI, Greeks, IV Rank)
+     d. Strategy selector → picks best strategy for conditions
+     e. If FLAT: enter if signal confidence >= threshold
+     f. If IN_TRADE: trailing SL + target + signal flip exit
+     g. Force-exit at EXIT_ALL_TIME
+  3. Graceful shutdown on SIGINT/SIGTERM
 """
 
+import os
+import sys
 import time
 import signal
-import sys
+import threading
 from datetime import datetime, time as dtime
 from loguru import logger
 
 import config
-import auth
+from session_manager import SessionManager
 import market_data as md
-from strategy import generate_signal, should_exit, Signal
-from paper_trader import PaperTrader
+from risk_engine import RiskEngine
+from paper_trader import PaperTrader, get_daily_summary
+from strategy_selector import select_strategy
+from signals_advanced import fetch_option_chain
 
-# ── Logging setup ─────────────────────────────────────────────
-# Logs go to stdout — captured by `podman logs` / `./run.sh logs`.
-# File logging is optional and only enabled if /app/logs is writable.
-import os
+# ── Logging ───────────────────────────────────────────────────
 logger.remove()
 logger.add(
     sys.stdout,
@@ -45,93 +48,217 @@ try:
         format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
     )
 except Exception:
-    logger.warning("File logging unavailable — stdout only (volume permission issue)")
+    logger.warning("File logging unavailable — stdout only")
 
 # ── Constants ─────────────────────────────────────────────────
-POLL_INTERVAL  = 30      # seconds between each market data check
-CANDLE_INTERVAL = "FIVE_MINUTE"
+POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL_SECS", "30"))
+MIN_CONFIDENCE   = int(os.getenv("MIN_SIGNAL_CONFIDENCE", "6"))
 
-_trader = PaperTrader()
+# ── Global state ──────────────────────────────────────────────
+_trader  = PaperTrader()
+_risk    = RiskEngine()
 _running = True
+_highest_ltp: float = 0.0   # tracks highest LTP for trailing SL
 
-# ── Graceful shutdown on SIGINT / SIGTERM ─────────────────────
+# ── Shutdown handler ──────────────────────────────────────────
 
-def _shutdown_handler(sig, frame):
+def _shutdown(sig, frame):
     global _running
-    logger.warning("⚡ Shutdown signal received — cleaning up...")
+    logger.warning("⚡ Shutdown signal — cleaning up...")
     _running = False
 
-signal.signal(signal.SIGINT,  _shutdown_handler)
-signal.signal(signal.SIGTERM, _shutdown_handler)
-
+signal.signal(signal.SIGINT,  _shutdown)
+signal.signal(signal.SIGTERM, _shutdown)
 
 # ── Time helpers ──────────────────────────────────────────────
 
-def _parse_time(t: str) -> dtime:
-    h, m = map(int, t.split(":"))
+def _t(s: str) -> dtime:
+    h, m = map(int, s.split(":"))
     return dtime(h, m)
 
+def _now() -> dtime:
+    return datetime.now().time()
 
 def _is_market_open() -> bool:
-    """True if current IST time is within trading window."""
-    now = datetime.now().time()
-    return _parse_time("09:15") <= now <= _parse_time("15:30")
-
+    return _t("09:15") <= _now() <= _t("15:30")
 
 def _is_entry_window() -> bool:
-    """True if new entries are allowed right now."""
-    now = datetime.now().time()
-    return _parse_time(config.ENTRY_TIME_START) <= now <= _parse_time(config.ENTRY_TIME_END)
-
+    return _t(config.ENTRY_TIME_START) <= _now() <= _t(config.ENTRY_TIME_END)
 
 def _is_force_exit_time() -> bool:
-    """True if we've passed the EOD force-exit time."""
-    return datetime.now().time() >= _parse_time(config.EXIT_ALL_TIME)
-
+    return _now() >= _t(config.EXIT_ALL_TIME)
 
 def _is_weekend() -> bool:
-    """True on Saturday (5) and Sunday (6) — NSE is closed."""
     return datetime.now().weekday() >= 5
 
-
-# ── Expiry resolution ─────────────────────────────────────────
+# ── Expiry builder ────────────────────────────────────────────
 
 def _get_expiry_string() -> str:
-    """
-    Build the expiry string for the option symbol.
-    Weekly example: "23SEP07"  (YY + Mon + DD)
-    Monthly example: "23SEP"   (YY + Mon)
-    Angel One uses uppercase month abbreviation.
-    """
+    from datetime import timedelta, date
     now = datetime.now()
     if config.EXPIRY_TYPE == "weekly":
-        # Next Thursday is weekly expiry
-        days_ahead = (3 - now.weekday()) % 7  # 3 = Thursday
+        days_ahead = (3 - now.weekday()) % 7
         if days_ahead == 0:
             days_ahead = 7
-        from datetime import timedelta
         expiry_dt = now + timedelta(days=days_ahead)
         return expiry_dt.strftime("%y%b%d").upper()
-    else:
-        return now.strftime("%y%b").upper()
+    return now.strftime("%y%b").upper()
 
+# ── Per-tick logic ────────────────────────────────────────────
 
-# ── Main trading loop ─────────────────────────────────────────
+def _tick():
+    global _highest_ltp
 
-def run() -> None:
-    global _running
+    # Weekend / pre-market guard
+    if _is_weekend():
+        logger.debug("Weekend — sleeping 1h")
+        time.sleep(3600)
+        return
 
-    logger.info("=" * 60)
-    logger.info(f"  NiftyBot starting | Mode: {config.TRADING_MODE.upper()}")
-    logger.info(f"  Instrument: {config.INSTRUMENT} | Lot: {config.LOT_SIZE}")
-    logger.info(f"  Target: +{config.PROFIT_TARGET_POINTS} pts / SL: -{config.STOP_LOSS_POINTS} pts")
-    logger.info(f"  Entry window: {config.ENTRY_TIME_START} – {config.ENTRY_TIME_END} IST")
-    logger.info(f"  Force exit: {config.EXIT_ALL_TIME} IST")
-    logger.info("=" * 60)
+    if not _is_market_open():
+        logger.debug("Outside market hours — waiting 60s")
+        time.sleep(60)
+        return
 
-    # ── Login ─────────────────────────────────────────────────
+    sm = SessionManager.get()
+
+    # ── Force-exit at EOD ─────────────────────────────────────
+    if _is_force_exit_time():
+        if not _trader.is_flat:
+            logger.warning(f"⏰ {config.EXIT_ALL_TIME} — force-closing position")
+            try:
+                sym   = _trader.open_trade["symbol"]
+                token = md.get_symbol_token(sym, exchange="NFO")
+                ltp   = md.get_ltp(sym, token, exchange="NFO")
+            except Exception:
+                ltp = _trader.open_trade["entry_price"]
+            _trader.exit(ltp, "EOD_FORCE_EXIT")
+            _risk.record_trade((ltp - _trader.open_trade.get("entry_price", ltp)) if _trader.open_trade else 0)
+        time.sleep(60)
+        return
+
+    # ── Risk gate check ───────────────────────────────────────
+    blackout, reason = _risk.is_blackout_day()
+    if blackout:
+        logger.info(f"🚫 {reason}")
+        time.sleep(300)
+        return
+
+    # ── Fetch market data ─────────────────────────────────────
     try:
-        auth.login()
+        df_5min  = md.get_nifty_candles(interval="FIVE_MINUTE")
+        df_1min  = md.get_nifty_candles(interval="ONE_MINUTE", lookback_days=1)
+        vix      = md.get_india_vix()
+        spot     = md.get_nifty_spot()
+    except Exception as exc:
+        logger.error(f"Market data error: {exc}")
+        return
+
+    # ── Fetch option chain (PCR / OI / Greeks) ────────────────
+    option_chain = None
+    try:
+        expiry_str = _get_expiry_string()
+        strike     = md.get_atm_strike(spot)
+        symbol_ce  = md.build_option_symbol(config.INSTRUMENT, expiry_str, strike, "CE")
+        option_chain = fetch_option_chain(sm.smart(), spot, expiry_str)
+    except Exception as exc:
+        logger.debug(f"Option chain unavailable: {exc} — proceeding without")
+
+    # ── EXIT logic (if in trade) ──────────────────────────────
+    if not _trader.is_flat:
+        try:
+            sym   = _trader.open_trade["symbol"]
+            token = md.get_symbol_token(sym, exchange="NFO")
+            ltp   = md.get_ltp(sym, token, exchange="NFO")
+        except Exception as exc:
+            logger.error(f"LTP fetch error: {exc}")
+            return
+
+        _highest_ltp = max(_highest_ltp, ltp)
+        entry        = _trader.open_trade["entry_price"]
+
+        # Use trailing SL from risk engine
+        should_exit, exit_reason = _risk.trailing_stop(entry, ltp, _highest_ltp)
+
+        if should_exit:
+            _trader.exit(ltp, exit_reason)
+            _risk.record_trade(ltp - entry)
+            _highest_ltp = 0.0
+        return
+
+    # ── ENTRY logic (if flat) ─────────────────────────────────
+    if not _is_entry_window():
+        logger.debug("Outside entry window")
+        return
+
+    can_trade, block_reason = _risk.can_trade()
+    if not can_trade:
+        logger.info(f"🔒 Trade blocked: {block_reason}")
+        return
+
+    # Strategy selector picks best strategy
+    signal, regime = select_strategy(
+        df_5min=df_5min,
+        df_1min=df_1min,
+        vix=vix,
+        option_chain=option_chain,
+        spot=spot,
+    )
+
+    if signal is None or signal.signal.value != "BUY":
+        logger.debug(f"No entry signal | regime={regime}")
+        return
+
+    if signal.confidence < MIN_CONFIDENCE:
+        logger.debug(f"Signal confidence {signal.confidence} < {MIN_CONFIDENCE} — skipping")
+        return
+
+    # Resolve option symbol, fetch token + LTP
+    try:
+        expiry_str = _get_expiry_string()
+        strike     = md.get_atm_strike(spot)
+        opt_type   = signal.option_type.value if signal.option_type else "CE"
+        symbol     = md.build_option_symbol(config.INSTRUMENT, expiry_str, strike, opt_type)
+        token      = md.get_symbol_token(symbol, exchange="NFO")
+        ltp        = md.get_ltp(symbol, token, exchange="NFO")
+    except Exception as exc:
+        logger.error(f"Entry symbol resolution error: {exc}")
+        return
+
+    # BLOCKER 5 FIX: OI liquidity check — skip illiquid strikes
+    liquid, liq_reason = md.check_liquidity(symbol, token, exchange="NFO")
+    if not liquid:
+        logger.warning(f"🚫 Skipping entry — {liq_reason}")
+        return
+
+    # Position sizing
+    lots = _risk.position_size(method=os.getenv("SIZING_METHOD", "fixed_fractional"))
+
+    _trader.enter(
+        symbol=symbol,
+        strike=strike,
+        option_type=opt_type,
+        ltp=ltp,
+        symbol_token=token,          # BLOCKER 1 FIX: pass token through
+        confidence=signal.confidence,
+        signal_detail=f"{signal.strategy}|{signal.reason[:80]}",
+    )
+    _highest_ltp = ltp   # reset trailing tracker
+
+# ── Main entry ────────────────────────────────────────────────
+
+def run():
+    logger.info("=" * 60)
+    logger.info(f"  NiftyBot v2 | Mode: {config.TRADING_MODE.upper()}")
+    logger.info(f"  Instrument : {config.INSTRUMENT} | Lot: {config.LOT_SIZE}")
+    logger.info(f"  Target     : +{config.PROFIT_TARGET_POINTS}pts / SL: -{config.STOP_LOSS_POINTS}pts")
+    logger.info(f"  Entry      : {config.ENTRY_TIME_START}–{config.ENTRY_TIME_END} IST")
+    logger.info(f"  Force exit : {config.EXIT_ALL_TIME} IST")
+    logger.info(f"  Poll every : {POLL_INTERVAL}s")
+    logger.info("=" * 60)
+
+    try:
+        SessionManager.get().connect()
     except Exception as exc:
         logger.critical(f"❌ Login failed: {exc}")
         sys.exit(1)
@@ -146,116 +273,17 @@ def run() -> None:
 
         if not _running:
             break
-
         time.sleep(POLL_INTERVAL)
 
     # ── Cleanup ───────────────────────────────────────────────
     if not _trader.is_flat:
-        logger.warning("🔔 Shutdown with open trade — force-exiting...")
-        try:
-            ltp = md.get_ltp(
-                _trader.open_trade["symbol"],
-                "",   # token unavailable here; acceptable for shutdown exit
-                exchange="NFO"
-            )
-        except Exception:
-            ltp = _trader.open_trade["entry_price"]
-        _trader.exit(ltp, "SHUTDOWN")
+        logger.warning("Open trade on shutdown — force-exiting")
+        entry = _trader.open_trade["entry_price"]
+        _trader.exit(entry, "SHUTDOWN")
 
-    auth.logout()
+    SessionManager.get().disconnect()
     logger.info("👋 NiftyBot stopped.")
 
-
-def _tick() -> None:
-    """Single iteration of the main loop."""
-
-    # ── Weekend / non-market guard ────────────────────────────
-    if _is_weekend():
-        logger.debug("Weekend — market closed. Sleeping...")
-        time.sleep(3600)
-        return
-
-    if not _is_market_open():
-        logger.debug("Outside market hours. Waiting...")
-        time.sleep(60)
-        return
-
-    # ── Force exit check (EOD) ────────────────────────────────
-    if _is_force_exit_time() and not _trader.is_flat:
-        logger.warning(f"⏰ {config.EXIT_ALL_TIME} reached — force-closing position")
-        try:
-            ltp = md.get_ltp(
-                _trader.open_trade["symbol"],
-                md.get_symbol_token(
-                    _trader.open_trade["symbol"], exchange="NFO"
-                ),
-                exchange="NFO"
-            )
-        except Exception as e:
-            logger.error(f"LTP fetch failed for force exit: {e}")
-            return
-        _trader.exit(ltp, "EOD_FORCE_EXIT")
-        return
-
-    if _is_force_exit_time():
-        logger.debug("Past force-exit time, no open position. Done for today.")
-        time.sleep(60)
-        return
-
-    # ── Fetch Nifty candles & VIX ─────────────────────────────
-    try:
-        df  = md.get_nifty_candles(interval=CANDLE_INTERVAL)
-        vix = md.get_india_vix()
-    except Exception as exc:
-        logger.error(f"Market data fetch error: {exc}")
-        return
-
-    # ── If flat and in entry window → evaluate entry ──────────
-    if _trader.is_flat and _is_entry_window() and _trader.can_trade:
-        result = generate_signal(df, vix=vix)
-
-        if result.signal == Signal.BUY and result.option_type is not None:
-            # Resolve strike and symbol
-            try:
-                spot   = md.get_nifty_spot()
-                strike = md.get_atm_strike(spot)
-                expiry = _get_expiry_string()
-                symbol = md.build_option_symbol(
-                    config.INSTRUMENT, expiry, strike, result.option_type.value
-                )
-                token = md.get_symbol_token(symbol, exchange="NFO")
-                ltp   = md.get_ltp(symbol, token, exchange="NFO")
-            except Exception as exc:
-                logger.error(f"Entry symbol resolution error: {exc}")
-                return
-
-            _trader.enter(
-                symbol=symbol,
-                strike=strike,
-                option_type=result.option_type.value,
-                ltp=ltp,
-                confidence=result.confidence,
-                signal_detail=result.reason,
-            )
-        else:
-            logger.debug(f"Signal: HOLD — {result.reason}")
-
-    # ── If in trade → check exit ──────────────────────────────
-    elif not _trader.is_flat:
-        try:
-            symbol = _trader.open_trade["symbol"]
-            token  = md.get_symbol_token(symbol, exchange="NFO")
-            ltp    = md.get_ltp(symbol, token, exchange="NFO")
-        except Exception as exc:
-            logger.error(f"LTP fetch for exit check failed: {exc}")
-            return
-
-        exit_now, reason = should_exit(_trader.open_trade["entry_price"], ltp, df)
-        if exit_now:
-            _trader.exit(ltp, reason)
-
-
-# ── Entry point ───────────────────────────────────────────────
 
 if __name__ == "__main__":
     run()

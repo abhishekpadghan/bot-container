@@ -9,8 +9,7 @@ pyotp==2.10.0
 # ── Data & Analysis ───────────────────────
 pandas==2.2.3
 numpy==1.26.4
-# All indicators (Supertrend, RSI, EMA, VWAP) are computed manually
-# in strategy.py using pure pandas/numpy — no extra TA library needed.
+scipy==1.13.1               # Black-Scholes option pricing in backtester
 
 # ── HTTP / Networking ─────────────────────
 requests==2.32.3
@@ -21,10 +20,10 @@ sqlalchemy==2.0.30
 # ── Logging ───────────────────────────────
 loguru==0.7.3
 
-# ── Scheduling (market hours check) ───────
+# ── Scheduling ────────────────────────────
 schedule==1.2.2
 
-# ── Dashboard (lightweight HTTP server) ───
+# ── Dashboard ─────────────────────────────
 flask==3.1.3
 
 # ── Environment variables ─────────────────
