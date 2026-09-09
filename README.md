@@ -13,8 +13,7 @@
 | Max Loss per Trade | ₹750 (hard stop-loss) |
 | Trailing Stop Activates | After +12 points profit |
 | Risk : Reward | 1 : 2 (10 pts SL → 20 pts target) |
-| Instrument | Nifty 50 Options (CE / PE) |
-| Lot Size | 75 units (verify current NSE lot size) |
+| Instruments | NIFTY 50, SENSEX (configurable — add more in `.env`) |
 | Transaction Costs | ₹216/trade deducted (brokerage + STT + slippage) |
 
 ---
@@ -242,6 +241,22 @@ Every 30 seconds during market hours (9:15–15:30 IST):
 
 ---
 
+## 📋 Supported Instruments
+
+| Instrument | Exchange | Lot Size | Strike Gap | Expiry | Cycle | Target / SL |
+|---|---|---|---|---|---|---|
+| **NIFTY 50** | NSE / NFO | 65 units | 50 pts | **Tuesday** | Weekly | 20 / 10 pts |
+| **SENSEX** | BSE / BFO | 20 units | 100 pts | **Thursday** | Weekly | 25 / 12 pts |
+| **BANKNIFTY** | NSE / NFO | 30 units | 100 pts | **Last Tuesday** | Monthly | 30 / 15 pts |
+| **BANKEX** | BSE / BFO | 30 units | 100 pts | **Last Thursday** | Monthly | 30 / 15 pts |
+| **FINNIFTY** | NSE / NFO | 60 units | 50 pts | **Last Tuesday** | Monthly | 20 / 10 pts |
+
+> Lot sizes and expiry schedules verified against NSE/BSE circulars (2025-26).
+> Override any lot size via env: `NIFTY_LOT_SIZE=65`, `FINNIFTY_LOT_SIZE=60` etc.
+> Enable instruments: `INSTRUMENTS=NIFTY,SENSEX,BANKNIFTY` in `.env` (default: `NIFTY,SENSEX`).
+
+---
+
 ## 🎯 6 Trading Strategies
 
 | Strategy | Trigger | Best Conditions | Target / SL |
@@ -307,7 +322,7 @@ All trades stored in `data/trades.db` (SQLite):
 | `symbol_token` | TEXT | Angel One exchange token |
 | `strike` | INTEGER | Strike price |
 | `option_type` | TEXT | `CE` or `PE` |
-| `lot_size` | INTEGER | Units per lot (75) |
+| `lot_size` | INTEGER | Units per lot (65 for NIFTY, 20 for SENSEX) |
 | `entry_price` | REAL | Premium at entry |
 | `exit_price` | REAL | Premium at exit |
 | `pnl_points` | REAL | Points gained/lost |
@@ -324,17 +339,24 @@ All trades stored in `data/trades.db` (SQLite):
 ## 📊 Backtesting
 
 ```bash
-# Open shell inside container
+# Open a shell inside the container first:
 ./run.sh shell
 
-# Test a single strategy on 90 days of data
+# ── Synthetic data (no credentials required) ──────────────────
+# Quick test with 90 days of simulated Nifty-like data (GBM model)
 python backtester.py --days 90 --strategy TREND_FOLLOW
-
-# Test all strategies
 python backtester.py --days 180 --all
 
+# ── Real Angel One historical data ────────────────────────────
+# Uses actual market candles via SmartAPI getCandleData endpoint.
+# Requires valid .env credentials. Up to ~100 days of intraday data.
+python backtester.py --days 90  --strategy TREND_FOLLOW --live-data
+python backtester.py --days 90  --strategy SCALP        --live-data
+python backtester.py --days 90  --all                   --live-data
+python backtester.py --days 60  --all  --live-data  --instrument SENSEX
+
 # Available strategies:
-# TREND_FOLLOW | SCALP | VWAP_REVERSAL | BREAKOUT
+# TREND_FOLLOW | SCALP | VWAP_REVERSAL | BREAKOUT | STRADDLE | IRON_CONDOR
 ```
 
 **Backtest report includes:**
@@ -342,7 +364,8 @@ python backtester.py --days 180 --all
 - Max drawdown, Sharpe ratio, Profit Factor
 - Verdict: ✅ Profitable / ⚠️ Marginal / ❌ Not profitable
 
-> ⚠️ Use real historical data for reliable results. Synthetic data gives directional guidance only.
+> 💡 **Use `--live-data` for reliable results.** Synthetic data uses GBM and gives directional guidance only.
+> Angel One provides up to ~100 days of intraday history via `getCandleData`. Falls back to synthetic automatically if login fails.
 
 ---
 

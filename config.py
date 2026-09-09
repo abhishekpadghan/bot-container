@@ -18,11 +18,25 @@ TOTP_SECRET  = os.environ["TOTP_SECRET"]
 TRADING_MODE = os.getenv("TRADING_MODE", "paper").lower()  # paper | live
 assert TRADING_MODE in ("paper", "live"), "TRADING_MODE must be 'paper' or 'live'"
 
-# ── Instrument ────────────────────────────────────────────────
-INSTRUMENT    = os.getenv("INSTRUMENT", "NIFTY").upper()
+# ── Instruments — configure which to trade ───────────────────
+# Single instrument:  INSTRUMENTS=NIFTY
+# Multiple:           INSTRUMENTS=NIFTY,SENSEX
+INSTRUMENTS_RAW = os.getenv("INSTRUMENTS", os.getenv("INSTRUMENT", "NIFTY"))
+INSTRUMENTS     = [i.strip().upper() for i in INSTRUMENTS_RAW.split(",")]
+INSTRUMENT      = INSTRUMENTS[0]   # primary instrument (backward compat)
+
 EXPIRY_TYPE   = os.getenv("EXPIRY_TYPE", "weekly").lower()   # weekly | monthly
 OPTION_TYPE   = os.getenv("OPTION_TYPE", "auto").lower()     # CE | PE | auto
-LOT_SIZE      = int(os.getenv("LOT_SIZE", "75"))
+# LOT_SIZE here is only a fallback default — each instrument uses its own
+# lot size defined in market_data.INSTRUMENT_REGISTRY.
+# Override per-instrument via: NIFTY_LOT_SIZE=65  SENSEX_LOT_SIZE=20
+LOT_SIZE      = int(os.getenv("LOT_SIZE", "65"))   # updated: Nifty default is 65
+
+# ── Per-instrument settings ───────────────────────────────────
+# These are used by InstrumentConfig.get(name) in market_data.py
+# You can override per-instrument lot size via env:
+#   SENSEX_LOT_SIZE=10
+#   BANKNIFTY_LOT_SIZE=30
 
 # ── Risk Parameters ───────────────────────────────────────────
 PROFIT_TARGET_POINTS = float(os.getenv("PROFIT_TARGET_POINTS", "20"))

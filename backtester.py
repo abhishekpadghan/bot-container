@@ -10,8 +10,15 @@ and produces a detailed performance report:
   - Best / worst trades
 
 Usage:
+  # Synthetic data (no login needed):
   python backtester.py --days 90 --strategy TREND_FOLLOW
-  python backtester.py --days 180  (tests all strategies)
+
+  # Real Angel One historical data (requires .env credentials):
+  python backtester.py --days 90 --strategy TREND_FOLLOW --live-data
+  python backtester.py --days 180 --all --live-data --instrument SENSEX
+
+  # All strategies:
+  python backtester.py --days 180 --all
 """
 
 import argparse
@@ -73,6 +80,62 @@ def _get_bt_conn() -> sqlite3.Connection:
     """)
     conn.commit()
     return conn
+
+
+# ── Real data source via Angel One SmartAPI ──────────────────
+
+def fetch_real_candles(
+    instrument: str = "NIFTY",
+    days: int = 90,
+    interval: str = "FIVE_MINUTE",
+) -> pd.DataFrame:
+    """
+    Fetch real historical OHLC candle data from Angel One SmartAPI.
+
+    Requires valid credentials in .env (API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET).
+    Angel One's getCandleData endpoint returns up to ~100 days of intraday data.
+
+    Args:
+        instrument: "NIFTY" | "SENSEX" | "BANKNIFTY" | "BANKEX" | "FINNIFTY"
+        days:       How many calendar days of history to fetch (max ~100 for intraday)
+        interval:   SmartAPI interval string — "FIVE_MINUTE" | "ONE_MINUTE" | "ONE_DAY"
+
+    Returns:
+        DataFrame with columns: datetime, open, high, low, close, volume
+        Sorted ascending by datetime, market hours only (9:15–15:30 IST).
+
+    Raises:
+        RuntimeError if login or API call fails.
+    """
+    try:
+        from session_manager import SessionManager
+        import market_data as md
+
+        logger.info(f"📡 Connecting to Angel One to fetch {days}d of {instrument} {interval} data...")
+        SessionManager.get().connect()
+        df = md.get_index_candles(instrument, interval=interval, lookback_days=days)
+
+        if df.empty:
+            raise RuntimeError("Angel One returned empty candle data — check credentials and market hours")
+
+        # Filter to market hours only: 09:15 – 15:30 IST
+        df = df[
+            (df["datetime"].dt.hour > 9) |
+            ((df["datetime"].dt.hour == 9) & (df["datetime"].dt.minute >= 15))
+        ]
+        df = df[
+            (df["datetime"].dt.hour < 15) |
+            ((df["datetime"].dt.hour == 15) & (df["datetime"].dt.minute <= 30))
+        ]
+        df = df.sort_values("datetime").reset_index(drop=True)
+
+        logger.info(f"✅ Fetched {len(df)} candles for {instrument} ({df['datetime'].min()} → {df['datetime'].max()})")
+        return df
+
+    except ImportError as exc:
+        raise RuntimeError(f"market_data module not available: {exc}")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to fetch real candles for {instrument}: {exc}")
 
 
 # ── Simulated data source ─────────────────────────────────────
@@ -185,11 +248,15 @@ class Backtester:
         strategy_name: str = "TREND_FOLLOW",
         days: int = 90,
         df: pd.DataFrame = None,
+        live_data: bool = False,
+        instrument: str = "NIFTY",
     ):
         self.strategy_name = strategy_name
         self.strategy      = ALL_STRATEGIES.get(strategy_name)
         self.days          = days
         self.df            = df
+        self.live_data     = live_data
+        self.instrument    = instrument.upper()
 
     def run(self) -> dict:
         """Run backtest and return results dict."""
@@ -197,8 +264,21 @@ class Backtester:
         run_id = str(uuid.uuid4())[:8]
 
         if self.df is None:
-            logger.info(f"📊 Generating {self.days}-day synthetic data for backtest...")
-            self.df = _generate_synthetic_candles(days=self.days)
+            if self.live_data:
+                try:
+                    self.df = fetch_real_candles(
+                        instrument=self.instrument,
+                        days=self.days,
+                        interval="FIVE_MINUTE",
+                    )
+                    logger.info(f"📊 Using REAL Angel One data for {self.instrument} backtest")
+                except RuntimeError as exc:
+                    logger.warning(f"⚠️  Real data fetch failed: {exc}")
+                    logger.warning("⚠️  Falling back to synthetic data")
+                    self.df = _generate_synthetic_candles(days=self.days)
+            else:
+                logger.info(f"📊 Generating {self.days}-day synthetic data for backtest...")
+                self.df = _generate_synthetic_candles(days=self.days)
 
         logger.info(
             f"🔄 Backtesting {self.strategy_name} | "
@@ -414,20 +494,45 @@ class Backtester:
 # ── CLI entry point ───────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="NiftyBot Backtester")
-    parser.add_argument("--days",     type=int, default=90,             help="Days of history")
-    parser.add_argument("--strategy", type=str, default="TREND_FOLLOW", help="Strategy name")
-    parser.add_argument("--all",      action="store_true",              help="Test all strategies")
+    parser = argparse.ArgumentParser(
+        description="NiftyBot Backtester",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Synthetic data (no credentials needed):
+  python backtester.py --days 90 --strategy TREND_FOLLOW
+  python backtester.py --days 180 --all
+
+  # Real Angel One data (requires .env credentials):
+  python backtester.py --days 90 --strategy TREND_FOLLOW --live-data
+  python backtester.py --days 90 --all --live-data --instrument SENSEX
+        """,
+    )
+    parser.add_argument("--days",       type=int,  default=90,             help="Days of history (default: 90)")
+    parser.add_argument("--strategy",   type=str,  default="TREND_FOLLOW", help="Strategy name (default: TREND_FOLLOW)")
+    parser.add_argument("--all",        action="store_true",               help="Test all strategies")
+    parser.add_argument("--live-data",  action="store_true",               help="Fetch real data from Angel One SmartAPI")
+    parser.add_argument("--instrument", type=str,  default="NIFTY",        help="Instrument for real data (default: NIFTY)")
     args = parser.parse_args()
 
     if args.all:
         for name in ALL_STRATEGIES:
             if name in ("STRADDLE", "IRON_CONDOR"):
                 continue  # skip multi-leg for now
-            bt = Backtester(strategy_name=name, days=args.days)
+            bt = Backtester(
+                strategy_name=name,
+                days=args.days,
+                live_data=args.live_data,
+                instrument=args.instrument,
+            )
             result = bt.run()
             bt.print_report(result)
     else:
-        bt = Backtester(strategy_name=args.strategy, days=args.days)
+        bt = Backtester(
+            strategy_name=args.strategy,
+            days=args.days,
+            live_data=args.live_data,
+            instrument=args.instrument,
+        )
         result = bt.run()
         bt.print_report(result)
