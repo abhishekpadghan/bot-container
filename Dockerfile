@@ -25,7 +25,7 @@ WORKDIR /app
 # Copy and install Python dependencies first (layer caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir --root-user-action=ignore -r requirements.txt
 
 # Copy application source
 COPY --chown=botuser:botuser . .

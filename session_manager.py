@@ -12,6 +12,7 @@ session that:
 
 import os
 import time
+import json
 import threading
 import pyotp
 from loguru import logger
@@ -23,6 +24,80 @@ os.makedirs("/tmp/logs", exist_ok=True)
 os.chdir("/tmp")
 from SmartApi import SmartConnect  # noqa: F811
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+
+# ── SDK monkey-patch: fix persistent connection bug ───────────
+#
+# SmartAPI SDK v1.5.5 bug: _request() calls module-level requests.request()
+# instead of self.reqsession, so every API call opens a NEW TCP connection.
+# Angel One's server-side rate limiter triggers on rapid connection open/close
+# cycles (not just request count), causing AB1021 even at very low call rates.
+#
+# Fix: replace _request() with a version that uses self.reqsession (the
+# persistent requests.Session with connection pooling) so all API calls
+# reuse the same TCP connection to Angel One's servers.
+#
+import requests as _requests
+import urllib.parse as _urlparse
+
+def _patched_request(self, route, method, parameters=None):
+    """Patched _request that uses self.reqsession (persistent connection pool)."""
+    params  = parameters.copy() if parameters else {}
+    uri     = self._routes[route].format(**params)
+    url     = _urlparse.urljoin(self.root, uri)
+    headers = self.requestHeaders()
+
+    if self.access_token:
+        headers["Authorization"] = "Bearer {}".format(self.access_token)
+
+    try:
+        if method in ("POST", "PUT"):
+            r = self.reqsession.request(
+                method, url,
+                data=json.dumps(params),
+                headers=headers,
+                verify=not self.disable_ssl,
+                allow_redirects=True,
+                timeout=self.timeout,
+                proxies=self.proxies,
+            )
+        else:
+            r = self.reqsession.request(
+                method, url,
+                params=json.dumps(params),
+                headers=headers,
+                verify=not self.disable_ssl,
+                allow_redirects=True,
+                timeout=self.timeout,
+                proxies=self.proxies,
+            )
+    except Exception as exc:
+        logger.error(f"HTTP {method} {url} failed: {exc}")
+        raise exc
+
+    if "json" in headers.get("Content-type", ""):
+        try:
+            data = json.loads(r.content.decode("utf8"))
+        except ValueError:
+            # Non-JSON response (rate-limit HTML/plain-text page)
+            raise Exception(
+                f"Couldn't parse the JSON response received from the server: {r.content}"
+            )
+        if data.get("status", False) is False:
+            logger.error(
+                f"API error {method} {url}: {data.get('message')} | {params}"
+            )
+        return data
+    elif "csv" in headers.get("Content-type", ""):
+        return r.content
+    else:
+        raise Exception(
+            f"Unknown Content-type ({headers.get('Content-type')}) response: {r.content}"
+        )
+
+# Apply patch to the SmartConnect class (affects all instances)
+SmartConnect._request = _patched_request
+logger.debug("✅ SmartAPI SDK patched: _request() now uses persistent reqsession")
 
 # ── Constants ─────────────────────────────────────────────────
 MAX_RETRIES       = 5
@@ -62,11 +137,15 @@ class SessionManager:
     # ── Public API ────────────────────────────────────────────
 
     def connect(self) -> SmartConnect:
-        """Login and start heartbeat. Returns SmartConnect object."""
+        """Login only. Call start_heartbeat() separately after warmup."""
         with self._session_lock:
             self._login_with_retry()
-            self._start_heartbeat()
         return self._smart
+
+    def start_heartbeat(self) -> None:
+        """Start the background heartbeat thread. Call after warmup is complete."""
+        with self._session_lock:
+            self._start_heartbeat()
 
     def smart(self) -> SmartConnect:
         """Get active session, reconnecting if needed."""
@@ -188,13 +267,17 @@ class SessionManager:
                 # Refresh token every 6 hours
                 if now - self._last_refresh > TOKEN_REFRESH_SECS:
                     self._refresh_jwt()
-                # Ping with a lightweight LTP call to verify connection
+                # Ping with a lightweight LTP call to verify connection.
+                # Use the shared _API_LOCK so this doesn't race the main tick.
                 if self._smart:
-                    resp = self._smart.ltpData(
-                        exchange="NSE",
-                        tradingsymbol="Nifty 50",
-                        symboltoken="99926000"
-                    )
+                    import market_data as _md
+                    with _md._API_LOCK:
+                        _md._api_throttle()
+                        resp = self._smart.ltpData(
+                            exchange="NSE",
+                            tradingsymbol="Nifty 50",
+                            symboltoken="99926000"
+                        )
                     if not resp.get("status"):
                         raise ValueError("Heartbeat ping returned status=False")
                     logger.debug(f"💓 Heartbeat OK | Nifty={resp['data']['ltp']}")

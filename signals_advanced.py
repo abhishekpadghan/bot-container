@@ -38,18 +38,38 @@ class OptionChainData:
     atm_theta:        float   # Theta (daily decay in points)
 
 
+_option_chain_warned = False   # log the missing-method warning only once
+
+
 def fetch_option_chain(smart, spot: float, expiry_token: str) -> Optional[OptionChainData]:
     """
     Fetch option chain from Angel One and compute PCR, OI, IV, Greeks.
     Returns None if fetch fails (bot continues with partial signals).
+
+    Note: getOptionGreeks is not available in smartapi-python 1.5.5.
+    When Angel One adds it, this will start working automatically.
+    Until then the option chain is skipped and confidence scoring uses
+    the 7 non-Greeks indicators only.
     """
+    global _option_chain_warned
     try:
+        if not hasattr(smart, "getOptionGreeks"):
+            if not _option_chain_warned:
+                logger.info(
+                    "ℹ️  getOptionGreeks not available in this SmartAPI version — "
+                    "OI/PCR/Greeks signals disabled. Bot runs on 7/10 indicators."
+                )
+                _option_chain_warned = True
+            return None
+
         resp = smart.getOptionGreeks({
             "name": config.INSTRUMENT,
             "expirydate": expiry_token,
         })
         if not resp.get("status") or not resp.get("data"):
-            logger.warning("Option chain fetch failed — skipping OI/PCR signals")
+            if not _option_chain_warned:
+                logger.debug("Option chain fetch returned no data — skipping OI/PCR signals")
+                _option_chain_warned = True
             return None
 
         data = resp["data"]
@@ -115,7 +135,9 @@ def fetch_option_chain(smart, spot: float, expiry_token: str) -> Optional[Option
             atm_theta=atm_theta,
         )
     except Exception as exc:
-        logger.warning(f"Option chain parse error: {exc}")
+        if not _option_chain_warned:
+            logger.debug(f"Option chain unavailable: {exc}")
+            _option_chain_warned = True
         return None
 
 

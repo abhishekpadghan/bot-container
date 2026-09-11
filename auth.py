@@ -54,7 +54,20 @@ def login() -> SmartConnect:
 
 
 def get_session() -> SmartConnect:
-    """Return active session, logging in if needed."""
+    """
+    Return active session.
+    Delegates to SessionManager (the production session manager) so that
+    market_data.py and auth.py both use the single shared SmartConnect
+    object — avoiding a second login() on the first API call.
+    """
+    try:
+        from session_manager import SessionManager
+        sm = SessionManager.get()
+        if sm._smart is not None:
+            return sm._smart
+    except Exception:
+        pass
+    # Fallback to local login (used in tests / standalone scripts)
     return _session if _session else login()
 
 

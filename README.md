@@ -243,17 +243,16 @@ Every 30 seconds during market hours (9:15–15:30 IST):
 
 ## 📋 Supported Instruments
 
-| Instrument | Exchange | Lot Size | Strike Gap | Expiry | Cycle | Target / SL |
-|---|---|---|---|---|---|---|
-| **NIFTY 50** | NSE / NFO | 65 units | 50 pts | **Tuesday** | Weekly | 20 / 10 pts |
-| **SENSEX** | BSE / BFO | 20 units | 100 pts | **Thursday** | Weekly | 25 / 12 pts |
-| **BANKNIFTY** | NSE / NFO | 30 units | 100 pts | **Last Tuesday** | Monthly | 30 / 15 pts |
-| **BANKEX** | BSE / BFO | 30 units | 100 pts | **Last Thursday** | Monthly | 30 / 15 pts |
-| **FINNIFTY** | NSE / NFO | 60 units | 50 pts | **Last Tuesday** | Monthly | 20 / 10 pts |
+| Instrument | Exchange | Lot Size | Strike Gap | Weekly Expiry | F&O Exchange |
+|---|---|---|---|---|---|
+| **NIFTY 50** | NSE | 65 units | 50 pts | **Tuesday** | NFO |
+| **SENSEX** | BSE | 20 units | 100 pts | **Thursday** | BFO |
+| **BANKNIFTY** | NSE | 30 units | 100 pts | Wednesday | NFO |
+| **BANKEX** | BSE | 15 units | 100 pts | Monday | BFO |
+| **FINNIFTY** | NSE | 40 units | 50 pts | Tuesday | NFO |
 
-> Lot sizes and expiry schedules verified against NSE/BSE circulars (2025-26).
-> Override any lot size via env: `NIFTY_LOT_SIZE=65`, `FINNIFTY_LOT_SIZE=60` etc.
-> Enable instruments: `INSTRUMENTS=NIFTY,SENSEX,BANKNIFTY` in `.env` (default: `NIFTY,SENSEX`).
+> Lot sizes verified against NSE/BSE circulars (2025-26). Override via `NIFTY_LOT_SIZE=65` in `.env`.
+> Enable any instrument: `INSTRUMENTS=NIFTY,SENSEX,BANKNIFTY` in `.env`.
 
 ---
 

@@ -196,39 +196,47 @@ class RiskEngine:
         entry_price: float,
         current_ltp: float,
         highest_ltp: float,
-        trail_pts: float = None,
     ) -> tuple[bool, str]:
         """
-        Trailing stop-loss logic.
+        Step trailing stop-loss.
 
-        Trail rule:
-          - Once profit >= TRAIL_ACTIVATION_POINTS, activate trailing
-          - SL trails TRAIL_DISTANCE_POINTS below the highest LTP seen
+        Phase 1 — before target (profit < TARGET):
+            Hard SL at entry - STOP_LOSS_POINTS (e.g. -10pts). No exit on target hit.
 
-        Returns: (should_exit, reason)
+        Phase 2 — after target reached (profit >= TARGET):
+            SL locks in at peak_profit - 5pts, advancing every tick as peak rises.
+            This guarantees at least (TARGET - 5) pts are banked once target is hit.
+
+        Examples (TARGET=20, trail=5):
+            peak=20  → SL=15  (profit will not fall below +15)
+            peak=25  → SL=20  (profit will not fall below +20)
+            peak=30  → SL=25  (profit will not fall below +25)
+
+        The trade only exits when LTP falls to the current SL level.
         """
-        trail_activation = float(os.getenv("TRAIL_ACTIVATION_POINTS", "12"))
-        trail_distance   = float(os.getenv("TRAIL_DISTANCE_POINTS",   "8"))
-        trail_pts        = trail_pts or trail_distance
+        trail_pts    = float(os.getenv("TRAIL_DISTANCE_POINTS", "5"))
+        target       = config.PROFIT_TARGET_POINTS
+        hard_sl      = config.STOP_LOSS_POINTS
 
-        pnl = current_ltp - entry_price
+        pnl          = current_ltp - entry_price
+        peak_profit  = highest_ltp - entry_price
 
-        # Hard stop-loss (never removed)
-        if pnl <= -config.STOP_LOSS_POINTS:
-            return True, f"HARD_STOPLOSS {pnl:+.1f}pts"
+        # Phase 1: hard stop-loss (before target is reached)
+        if peak_profit < target:
+            if pnl <= -hard_sl:
+                return True, f"HARD_SL {pnl:+.1f}pts (SL={-hard_sl:+.0f})"
+            return False, ""
 
-        # Target hit
-        if pnl >= config.PROFIT_TARGET_POINTS:
-            return True, f"TARGET {pnl:+.1f}pts"
+        # Phase 2: target already reached — step trail
+        # SL = peak_profit - trail_pts, floored at (target - trail_pts) minimum
+        step_sl_profit = peak_profit - trail_pts   # e.g. peak=25 → sl_profit=20
+        step_sl_price  = entry_price + step_sl_profit
 
-        # Trailing SL (only once we've reached activation threshold)
-        if highest_ltp - entry_price >= trail_activation:
-            trail_sl = highest_ltp - trail_pts
-            if current_ltp <= trail_sl:
-                return True, (
-                    f"TRAILING_SL {pnl:+.1f}pts "
-                    f"(peak={highest_ltp-entry_price:+.1f}, trail={trail_pts})"
-                )
+        if current_ltp <= step_sl_price:
+            return True, (
+                f"STEP_TRAIL {pnl:+.1f}pts "
+                f"(peak={peak_profit:+.1f}, SL locked at +{step_sl_profit:.1f})"
+            )
 
         return False, ""
 

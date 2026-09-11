@@ -69,7 +69,10 @@ case "$CMD" in
 
     build)
         echo "🔨 Building image..."
-        $COMPOSE -f "$COMPOSE_FILE" build --no-cache bot
+        # BUILDAH_FORMAT=docker → makes Podman use Docker image format
+        # so HEALTHCHECK in the Dockerfile is honoured (not silently ignored).
+        # Has no effect when using docker compose.
+        BUILDAH_FORMAT=docker $COMPOSE -f "$COMPOSE_FILE" build --no-cache bot
         echo "✅ Build complete."
         ;;
 
