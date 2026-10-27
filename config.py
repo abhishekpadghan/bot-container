@@ -44,6 +44,24 @@ STOP_LOSS_POINTS     = float(os.getenv("STOP_LOSS_POINTS", "10"))
 DAILY_PROFIT_TARGET  = float(os.getenv("DAILY_PROFIT_TARGET", "1500"))
 DAILY_MAX_LOSS       = float(os.getenv("DAILY_MAX_LOSS", "750"))
 MAX_TRADES_PER_DAY   = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
+COST_PER_TRADE       = float(os.getenv("COST_PER_TRADE", "216"))        # round-trip brokerage+taxes+slippage (₹)
+# Worst NET loss one stopped-out trade may cost (stop distance × lot + COST_PER_TRADE).
+# Strategies cap their stop so this holds — at 750 and ₹216 costs, Nifty's stop is ≤ 8.2 premium pts.
+MAX_LOSS_PER_TRADE   = float(os.getenv("MAX_LOSS_PER_TRADE", "750"))
+
+# ── Timing ────────────────────────────────────────────────────
+CANDLE_MINUTES       = 5     # strategies decide ONCE per closed candle of this size
+CANDLE_SETTLE_SECS   = int(os.getenv("CANDLE_SETTLE_SECS", "6"))    # wait after a candle closes before deciding on it
+# Candles are built locally from price samples; the rate-limited historical API is only used
+# to fill gaps and to reconcile with the official candles this often (minutes).
+CANDLE_RECONCILE_MINUTES = int(os.getenv("CANDLE_RECONCILE_MINUTES", "30"))
+CANDLE_API_RETRY_SECS    = int(os.getenv("CANDLE_API_RETRY_SECS", "120"))   # min gap between API attempts
+EXIT_POLL_SECS       = int(os.getenv("EXIT_POLL_SECS", "4"))        # in a trade: check stop/target this often
+EXPIRY_WEEKDAY       = int(os.getenv("EXPIRY_WEEKDAY", "1"))        # Nifty weekly expiry: 0=Mon … 1=Tue
+# The bot always buys the NEXT expiry's option (never the one expiring today), so the classic
+# "no option buying on expiry afternoon" theta rule does not apply. It suppressed a valid Oct-13
+# 14:15 TREND_DAY signal. Set to 1 only if you ever trade the expiring contract.
+BLOCK_EXPIRY_AFTERNOON = os.getenv("BLOCK_EXPIRY_AFTERNOON", "0") == "1"
 
 # ── Indicator Parameters ──────────────────────────────────────
 RSI_PERIOD            = int(os.getenv("RSI_PERIOD", "14"))

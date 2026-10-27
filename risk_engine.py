@@ -75,8 +75,10 @@ class RiskEngine:
         re.record_trade(pnl_points=15)
     """
 
-    def __init__(self):
+    def __init__(self, expiry_weekday: Optional[int] = None):
         self.state = RiskState()
+        # Weekly expiry weekday of the instrument this engine guards (Nifty Tue=1, Sensex Thu=3)
+        self.expiry_weekday = config.EXPIRY_WEEKDAY if expiry_weekday is None else expiry_weekday
 
     # ── Calendar checks ───────────────────────────────────────
 
@@ -98,8 +100,8 @@ class RiskEngine:
         return date.today().isoformat() in CAUTION_DATES
 
     def is_expiry_day(self) -> bool:
-        """True if today is Thursday (weekly F&O expiry)."""
-        return date.today().weekday() == 3  # Thursday
+        """True if today is the weekly F&O expiry weekday (Tuesday for Nifty since 2025)."""
+        return date.today().weekday() == self.expiry_weekday
 
     def is_expiry_afternoon(self) -> bool:
         """After 1 PM on expiry day — theta decay kills option buyers."""
@@ -137,7 +139,7 @@ class RiskEngine:
             return False, f"{self.state.consecutive_losses} consecutive losses — cooling off"
 
         # 6. Expiry afternoon — option buyers get crushed by theta
-        if self.is_expiry_afternoon():
+        if config.BLOCK_EXPIRY_AFTERNOON and self.is_expiry_afternoon():
             return False, "Expiry afternoon — theta risk too high for buyers"
 
         return True, ""
@@ -240,18 +242,87 @@ class RiskEngine:
 
         return False, ""
 
+    def exit_check(
+        self,
+        entry_price: float,
+        current_ltp: float,
+        peak_ltp:    float,
+        sl_pts:      Optional[float] = None,
+        tgt_pts:     Optional[float] = None,
+        trail_at:    Optional[float] = None,
+        trail_dist:  Optional[float] = None,
+    ) -> tuple[bool, str]:
+        """
+        Per-trade exit rules, in option-premium points.
+
+          * hard stop   : entry - sl_pts
+          * fixed target: entry + tgt_pts (skipped when tgt_pts is None → trail-only)
+          * trailing    : once peak profit >= trail_at, the stop follows
+                          trail_dist behind the peak (never below the hard stop)
+
+        Any value left as None falls back to the global settings, so trades saved
+        by older code (without per-trade values) still get a sensible exit.
+        """
+        sl = sl_pts if sl_pts is not None else config.STOP_LOSS_POINTS
+        if sl_pts is None and tgt_pts is None and trail_at is None:
+            # legacy trade saved without per-trade values: global target + step trail
+            return self.trailing_stop(entry_price, current_ltp, peak_ltp)
+
+        pnl  = current_ltp - entry_price
+        peak = peak_ltp - entry_price
+        stop = -sl
+        if trail_at is not None and peak >= trail_at:
+            stop = max(stop, peak - (trail_dist if trail_dist is not None else sl * 0.5))
+
+        if pnl <= stop:
+            kind = "HARD_SL" if stop <= -sl + 1e-9 else "TRAIL"
+            return True, f"{kind} {pnl:+.1f}pts (peak {peak:+.1f}, stop {stop:+.1f})"
+        if tgt_pts is not None and pnl >= tgt_pts:
+            return True, f"TARGET {pnl:+.1f}pts"
+        return False, ""
+
     # ── Trade recording ───────────────────────────────────────
 
-    def record_trade(self, pnl_points: float):
-        """Update risk state after a trade closes."""
+    def restore_from_trades(self, closed_trades: list[dict]) -> None:
+        """
+        Rebuild today's risk state from the trades table after a restart, so the
+        daily limits and the consecutive-loss cool-off survive a container restart.
+        `closed_trades` must be today's closed trades, oldest first.
+        """
         self.state.reset_for_new_day()
-        pnl_inr = pnl_points * config.LOT_SIZE
+        for t in closed_trades:
+            net = t.get("pnl_inr_net") or 0.0
+            self.state.daily_pnl   += net
+            self.state.trade_count += 1
+            self.state.peak_pnl     = max(self.state.peak_pnl, self.state.daily_pnl)
+            if net > 0:
+                self.state.consecutive_losses = 0
+                self.state.consecutive_wins  += 1
+            else:
+                self.state.consecutive_wins   = 0
+                self.state.consecutive_losses += 1
+        if closed_trades:
+            logger.info(
+                f"♻️  Risk state restored: {self.state.trade_count} trade(s), "
+                f"net ₹{self.state.daily_pnl:+.0f}, consecutive losses "
+                f"{self.state.consecutive_losses}"
+            )
+
+    def record_trade(self, pnl_points: float, net_inr: Optional[float] = None):
+        """
+        Update risk state after a trade closes.
+        Pass `net_inr` (P&L after costs) so daily limits and win/loss streaks
+        match what the trader actually books; without it, gross points × lot
+        size is used.
+        """
+        self.state.reset_for_new_day()
+        pnl_inr = net_inr if net_inr is not None else pnl_points * config.LOT_SIZE
         self.state.daily_pnl    += pnl_inr
         self.state.trade_count  += 1
         self.state.lots_traded  += 1
         self.state.peak_pnl      = max(self.state.peak_pnl, self.state.daily_pnl)
 
-        if pnl_points > 0:
+        if pnl_inr > 0:
             self.state.consecutive_losses = 0
             self.state.consecutive_wins  += 1
         else:

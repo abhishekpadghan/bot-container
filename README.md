@@ -18,6 +18,39 @@
 
 ---
 
+## 🔬 Strategy evidence, timing & persistence (read this first)
+
+**Strategy evidence.** `research/strategy_lab.py` back-tests ideas on ~70 days of real Nifty 5-min
+candles with a modelled ATM option, ₹216 costs, closed-bar signals and a held-out test period
+(`research/data/` holds the candles; re-download with `research/fetch_history.py`).
+**Every idea lost money after costs** — random entries lose ~₹480/trade to theta + costs, and the
+best strategies only reduced that. Default is therefore `ENABLED_STRATEGIES=TREND_DAY`: it trades
+only clear trend days (≈ 0.5 trades/day) and had the smallest loss (−₹3.2k over 70 days, 36 trades,
+profit factor 0.77, improving month by month). **Treat it as a paper-trading experiment; do not go
+live until weeks of forward paper results are net-positive.** The old `backtester.py` compares an
+option premium with the *index level* and its results are not meaningful.
+
+**Timing.** Entry decisions are taken once per *closed* 5-min candle (+6s). In a trade the stop /
+target / trail are checked every 4s (`EXIT_POLL_SECS`) using the exit rules saved with that trade.
+The dashboard spot refreshes every 5s.
+
+**Candles & the Angel One rate limit.** 5-minute candles are built *locally* from the price samples
+the bot already takes every 5s (`candle_store.py`) and saved to `data/candles_NIFTY_5m.csv`, so a
+restart reloads them. The rate-limited historical API (`getCandleData`) is only used to fill gaps
+(e.g. after downtime) and to reconcile with the exchange's official candles every
+`CANDLE_RECONCILE_MINUTES` (30) — a failure there never delays a decision. Each reconciliation logs
+`local vs official candles … err` so you can see how accurate the local candles are.
+
+**Persistence.** `data/trades.db` (named volume `bot_data`) is never deleted by the bot. On restart
+today's P&L, trade count, loss streak, once-a-day flags and any **open position** (with its peak and
+exit rules) are restored; shutting down never force-closes a position. `orders` table = every BUY/SELL
+(paper ones tagged SIMULATED). Full history is also written to `data/exports/*.csv` plus a daily
+`.db` snapshot; `./run.sh backup` copies them to `./backups/` on your PC.
+⚠️ `podman volume rm bot-container_bot_data` or `podman-compose down -v` **would** delete history —
+`./run.sh stop` (plain `down`) does not.
+
+---
+
 ## 🏗️ Architecture — All Files
 
 ```

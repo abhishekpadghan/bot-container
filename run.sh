@@ -15,8 +15,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COMPOSE_FILE="${SCRIPT_DIR}/podman-compose.yml"
+COMPOSE_FILE="$(cygpath -w "${SCRIPT_DIR}/podman-compose.yml")"
 ENV_FILE="${SCRIPT_DIR}/.env"
+
 
 # ── Detect: use podman compose or docker compose ─────────────
 if command -v podman &>/dev/null; then
@@ -81,6 +82,11 @@ case "$CMD" in
         $COMPOSE -f "$COMPOSE_FILE" run --rm --no-deps cli report.py
         ;;
 
+    backup)
+        echo "💾 Backing up trade + order history to ./backups ..."
+        $COMPOSE -f "$COMPOSE_FILE" run --rm --no-deps cli backup.py
+        ;;
+
     shell)
         echo "🐚 Opening shell inside bot container..."
         $COMPOSE -f "$COMPOSE_FILE" run --rm --no-deps --entrypoint bash cli
@@ -97,6 +103,7 @@ case "$CMD" in
         echo "  ./run.sh status     Show container status"
         echo "  ./run.sh build      Rebuild Docker image"
         echo "  ./run.sh report     Print today's P&L report"
+        echo "  ./run.sh backup     Copy trade/order history to ./backups"
         echo "  ./run.sh shell      Open bash inside container"
         echo ""
         ;;

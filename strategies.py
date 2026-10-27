@@ -15,7 +15,9 @@ Each strategy exposes:
   - name, description, best_conditions
 """
 
+import os
 from dataclasses import dataclass
+from datetime import date
 from typing import Optional
 import pandas as pd
 import numpy as np
@@ -34,8 +36,10 @@ class StrategySignal:
     option_type:  Optional[OptionType]
     confidence:   int          # 0–10
     reason:       str
-    suggested_sl_pts:  float = None   # override default SL
-    suggested_tgt_pts: float = None   # override default target
+    suggested_sl_pts:  float = None   # override default SL   (option PREMIUM points)
+    suggested_tgt_pts: float = None   # override default target (None = no fixed target, trail only)
+    trail_at_pts:      float = None   # start trailing once this much profit is reached (premium pts)
+    trail_dist_pts:    float = None   # trail this far behind the peak (premium pts)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -60,26 +64,35 @@ class TrendFollowStrategy:
         if len(df) < 25:
             return None
 
-        row = df.iloc[-2]
-        score = 0
-        if row["supertrend_dir"] == "UP":     score += 1
-        if row["ema_fast"] > row["ema_slow"]: score += 1
-        if 45 <= row["rsi"] <= 65:            score += 1
-        if row["close"] > row["vwap"]:        score += 1
+        # df holds COMPLETED candles only (see main._closed_candles) → last row is the signal bar
+        row = df.iloc[-1]
+        bull = (
+            (row["supertrend_dir"] == "UP")
+            + (row["ema_fast"] > row["ema_slow"])
+            + (45 <= row["rsi"] <= 65)
+            + (row["close"] > row["vwap"])
+        )
+        # The original code only scored the bullish side, so PE entries were unreachable.
+        bear = (
+            (row["supertrend_dir"] == "DOWN")
+            + (row["ema_fast"] < row["ema_slow"])
+            + (35 <= row["rsi"] <= 55)
+            + (row["close"] < row["vwap"])
+        )
 
-        if score >= 3:
+        if bull >= 3:
             return StrategySignal(
                 strategy=self.name, signal=Signal.BUY,
-                option_type=OptionType.CE, confidence=score * 2,
-                reason=f"Trend Bull score={score}/4",
+                option_type=OptionType.CE, confidence=int(bull) * 2,
+                reason=f"Trend Bull score={int(bull)}/4",
                 suggested_tgt_pts=config.PROFIT_TARGET_POINTS,
                 suggested_sl_pts=config.STOP_LOSS_POINTS,
             )
-        if score <= -3:
+        if bear >= 3:
             return StrategySignal(
                 strategy=self.name, signal=Signal.BUY,
-                option_type=OptionType.PE, confidence=abs(score) * 2,
-                reason=f"Trend Bear score={score}/4",
+                option_type=OptionType.PE, confidence=int(bear) * 2,
+                reason=f"Trend Bear score={int(bear)}/4",
                 suggested_tgt_pts=config.PROFIT_TARGET_POINTS,
                 suggested_sl_pts=config.STOP_LOSS_POINTS,
             )
@@ -207,7 +220,7 @@ class VWAPReversalStrategy:
         if len(df) < 10:
             return None
 
-        row = df.iloc[-2]
+        row = df.iloc[-1]   # df holds completed candles only
         close, vwap, rsi = row["close"], row["vwap"], row["rsi"]
 
         if vwap == 0:
@@ -329,10 +342,101 @@ class IronCondorStrategy:
 
 
 # ─────────────────────────────────────────────────────────────
+# 7. TREND DAY (selective continuation — the bot's default strategy)
+# ─────────────────────────────────────────────────────────────
+
+class TrendDayStrategy:
+    """
+    Trades only clear trend days, at most once per day:
+      * price is >= MIN_MOVE away from the day's open,
+      * on the right side of the session average price and the 9/21 EMAs,
+      * and the just-closed 5-min candle prints a fresh session high (CE) / low (PE).
+    Risk is ATR-scaled and trail-only (no fixed target) so winners can run.
+
+    On 70 days of real Nifty candles (research/strategy_lab.py) this had the smallest
+    net loss of everything tested and trades rarely (so costs bite less) — but it was
+    still NOT profitable after costs. Treat it as a paper-trading experiment.
+    """
+    name = "TREND_DAY"
+    description = "Fresh session high/low on a >0.4% trend day, ATR stop, trail-only exit"
+    best_conditions = "Strong directional days; deliberately stays flat on choppy days"
+
+    MIN_MOVE      = float(os.getenv("TREND_DAY_MIN_MOVE", "0.004"))   # 0.4% from the open
+    FIRST_BAR     = 12      # nothing before the 12th 5-min bar (10:15) — let the day establish itself
+    SL_ATR        = 1.0     # stop distance in ATRs of the index
+    TRAIL_AT_R    = 1.0     # start trailing after +1R
+    TRAIL_DIST_R  = 0.5     # trail 0.5R behind the peak
+    OPTION_DELTA  = 0.5     # ATM option: premium moves ~0.5 pt per index pt
+    MIN_SL_PREM   = 4.0     # never tighter than this (premium points)
+
+    def __init__(self) -> None:
+        self._fired: dict[str, date] = {}      # instrument → day it already traded
+
+    def on_entry(self, instrument: str = "") -> None:
+        """Called by the bot after a trade is actually opened — one trade per day per instrument."""
+        self._fired[instrument] = date.today()
+
+    def should_enter(
+        self, df: pd.DataFrame, vix: float = 0,
+        instrument: str = "", lot_size: Optional[int] = None, cost: Optional[float] = None,
+    ) -> Optional[StrategySignal]:
+        if vix > config.VIX_MAX_THRESHOLD or self._fired.get(instrument) == date.today():
+            return None
+        if len(df) < 30:
+            return None
+
+        df = df.copy()
+        df["_d"] = pd.to_datetime(df["datetime"]).dt.date
+        day = df[df["_d"] == df["_d"].iloc[-1]]
+        if len(day) - 1 < self.FIRST_BAR:
+            return None
+
+        df = compute_ema(df)
+        pc = df["close"].shift()
+        tr = pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(), (df["low"] - pc).abs()], axis=1).max(axis=1)
+        atr = float(tr.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
+
+        last        = df.iloc[-1]
+        close       = float(last["close"])
+        day_open    = float(day["open"].iloc[0])
+        move        = (close - day_open) / day_open
+        typical     = (day["high"] + day["low"] + day["close"]) / 3
+        session_avg = float(typical.mean())          # index candles have no volume → no true VWAP
+        sess_hi     = float(day["high"].iloc[:-1].max())
+        sess_lo     = float(day["low"].iloc[:-1].min())
+        bull_ema    = last["ema_fast"] > last["ema_slow"]
+
+        if move >= self.MIN_MOVE and close > session_avg and bull_ema and close > sess_hi:
+            opt, why = OptionType.CE, f"up {move*100:.2f}% from open, new session high {close:.0f}>{sess_hi:.0f}"
+        elif move <= -self.MIN_MOVE and close < session_avg and not bull_ema and close < sess_lo:
+            opt, why = OptionType.PE, f"down {abs(move)*100:.2f}% from open, new session low {close:.0f}<{sess_lo:.0f}"
+        else:
+            return None
+
+        # Stop in option-premium points, capped so one stopped-out trade (stop + costs)
+        # cannot exceed MAX_LOSS_PER_TRADE. Lot size / costs / index level differ per
+        # instrument, so the cap and the minimum stop distance are scaled accordingly.
+        lot      = lot_size or config.LOT_SIZE
+        cost     = config.COST_PER_TRADE if cost is None else cost
+        cap_prem = (config.MAX_LOSS_PER_TRADE - cost) / lot
+        floor_idx = 0.00035 * close                      # ≈ 8 pts on Nifty, ≈ 25 on Sensex
+        sl_prem = max(self.MIN_SL_PREM, min(max(self.SL_ATR * atr, floor_idx) * self.OPTION_DELTA, cap_prem))
+        return StrategySignal(
+            strategy=self.name, signal=Signal.BUY, option_type=opt, confidence=7,
+            reason=f"Trend day: {why}",
+            suggested_sl_pts=round(sl_prem, 1),
+            suggested_tgt_pts=None,
+            trail_at_pts=round(sl_prem * self.TRAIL_AT_R, 1),
+            trail_dist_pts=round(sl_prem * self.TRAIL_DIST_R, 1),
+        )
+
+
+# ─────────────────────────────────────────────────────────────
 # Strategy Registry — all strategies in one place
 # ─────────────────────────────────────────────────────────────
 
 ALL_STRATEGIES = {
+    "TREND_DAY":      TrendDayStrategy(),
     "TREND_FOLLOW":   TrendFollowStrategy(),
     "SCALP":          ScalpStrategy(),
     "STRADDLE":       StraddleStrategy(),
@@ -340,3 +444,12 @@ ALL_STRATEGIES = {
     "BREAKOUT":       BreakoutStrategy(),
     "IRON_CONDOR":    IronCondorStrategy(),
 }
+
+# Only these run live. Everything else lost money on 70 days of real data (see
+# research/strategy_lab.py); add names here via ENABLED_STRATEGIES to experiment.
+# IRON_CONDOR is excluded from execution: it needs a multi-leg SELL order, which the
+# single-leg paper/live trader cannot place (it would have bought a plain CE instead).
+ENABLED_STRATEGIES = {
+    s.strip().upper()
+    for s in os.getenv("ENABLED_STRATEGIES", "TREND_DAY").split(",") if s.strip()
+} - {"IRON_CONDOR"}

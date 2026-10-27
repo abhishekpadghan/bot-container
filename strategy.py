@@ -196,7 +196,13 @@ def compute_vwap(df: pd.DataFrame) -> pd.DataFrame:
         cum_tp  = (g["_typical"] * g["volume"]).cumsum()
         return cum_tp / cum_vol.replace(0, np.nan)
 
-    df["vwap"] = df.groupby("_date", group_keys=False).apply(_vwap_group)
+    if df["volume"].sum() > 0:
+        df["vwap"] = df.groupby("_date", group_keys=False).apply(_vwap_group)
+    else:
+        # Angel One index candles carry ZERO volume, so a true VWAP is undefined
+        # (it came out NaN and silently disabled every VWAP-based rule). Fall back
+        # to the session's running average of typical price.
+        df["vwap"] = df.groupby("_date")["_typical"].transform(lambda s: s.expanding().mean())
     df["vwap"] = df["vwap"].ffill()
     df.drop(columns=["_typical", "_date"], inplace=True)
     return df

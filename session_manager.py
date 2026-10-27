@@ -278,9 +278,25 @@ class SessionManager:
                             tradingsymbol="Nifty 50",
                             symboltoken="99926000"
                         )
+
+                    if not isinstance(resp, dict):
+                        raise ValueError(
+                            f"Heartbeat returned unexpected response: {type(resp).__name__}"
+                        )
+
                     if not resp.get("status"):
-                        raise ValueError("Heartbeat ping returned status=False")
-                    logger.debug(f"💓 Heartbeat OK | Nifty={resp['data']['ltp']}")
+                        raise ValueError(
+                            f"Heartbeat ping returned status=False: "
+                            f"{resp.get('message', 'unknown')}"
+                        )
+
+                    data = resp.get("data") or {}
+                    ltp = data.get("ltp")
+
+                    if ltp is None:
+                        raise ValueError(f"Heartbeat response missing LTP: {resp}")
+
+                    logger.debug(f"💓 Heartbeat OK | Nifty={ltp}")    
             except Exception as exc:
                 logger.error(f"💔 Heartbeat failed: {exc} — reconnecting...")
                 try:

@@ -10,6 +10,7 @@ Provides:
   - get_symbol_token()  : Resolve symbol name → exchange token
 """
 
+import os
 import time
 from datetime import datetime, timedelta
 from typing import Optional
@@ -32,7 +33,7 @@ _TOKEN_CACHE: dict[str, str] = {}
 # Prevents hammering searchScrip every tick for the same missing scrip.
 # Key: "exchange:symbol"  Value: monotonic timestamp of the failure.
 _TOKEN_MISS_CACHE: dict[str, float] = {}
-_TOKEN_MISS_TTL = 120   # seconds — retry AB4047 symbols after 2 minutes
+_TOKEN_MISS_TTL = 600   # seconds — retry AB4047 symbols after 2 minutes
 
 # ── Candle cache ──────────────────────────────────────────────────────
 # getCandleData (historical endpoint) has a STRICTER quota than ltpData:
@@ -44,10 +45,24 @@ _TOKEN_MISS_TTL = 120   # seconds — retry AB4047 symbols after 2 minutes
 import threading as _threading
 _CANDLE_CACHE: dict[str, tuple] = {}
 _CANDLE_CACHE_LOCK = _threading.Lock()
-_CANDLE_TTL = 62   # seconds — cache candles for 62s (just over 1 min)
-                   # Angel One getCandleData quota: ~3 calls/min rolling window.
-                   # 62s TTL guarantees at most 1 getCandleData call per window
-                   # regardless of POLL_INTERVAL (even if set to 30s in .env).
+# Strategy uses FIVE_MINUTE candles and always evaluates the LAST
+# COMPLETED candle (df.iloc[-2]).
+#
+# Therefore there is no reason to call getCandleData every 60 seconds.
+# Fetching once every ~5 minutes is sufficient and greatly reduces
+# historical-endpoint pressure.
+#
+# Keep this slightly above 5 minutes so a 60s polling loop does not
+# immediately refetch on the 5-minute boundary.
+_CANDLE_TTL = 310   # seconds (~5m 10s) — only used for intervals missing from _INTERVAL_SECS
+
+# Candle length in seconds. Cached candles are refreshed right after each candle
+# CLOSES (not on a fixed 310s clock), so a decision always uses the newest
+# completed candle while historical-endpoint calls stay at ~1 per candle.
+_INTERVAL_SECS = {
+    "ONE_MINUTE": 60, "THREE_MINUTE": 180, "FIVE_MINUTE": 300, "TEN_MINUTE": 600,
+    "FIFTEEN_MINUTE": 900, "THIRTY_MINUTE": 1800, "ONE_HOUR": 3600,
+}
 
 # ── Global API rate-limit throttle ───────────────────────────────────
 # Angel One enforces AB1021 at >3 calls per 10-second rolling window.
@@ -61,7 +76,7 @@ _CANDLE_TTL = 62   # seconds — cache candles for 62s (just over 1 min)
 # the inter-call gap on Angel One's servers, not just in our process.
 _API_LOCK          = _threading.Lock()
 _LTP_CALL_DELAY    = 1.5   # seconds between ltpData calls (lax quota)
-_CANDLE_CALL_DELAY = 6.0   # seconds before getCandleData (strict ~1 req/min quota)
+_CANDLE_CALL_DELAY = 10.0   # seconds before getCandleData (strict ~1 req/min quota)
                             # Increased from 4s to 6s: gives more breathing room
                             # when ltpData calls are interleaved in the same window.
 _last_api_call_t   = 0.0   # monotonic timestamp of the last API call sent (module-level)
@@ -155,8 +170,8 @@ INSTRUMENT_REGISTRY: dict[str, InstrumentConfig] = {
     # ── SENSEX (BSE) ──────────────────────────────────────────
     "SENSEX": InstrumentConfig(
         name           = "SENSEX",
-        index_token    = "99919012",     # ✅ BSE Sensex index token (Angel One scrip master)
-        index_symbol   = "BSE Sensex",  # ✅ exact display name Angel One uses for ltpData
+        index_token    = "99919000",     # ✅ verified in Angel One scrip master (BSE, AMXIDX); 99919012 was wrong
+        index_symbol   = "SENSEX",       # ✅ symbol per scrip master
         index_exchange = "BSE",
         fo_exchange    = "BFO",
         lot_size       = _lot("SENSEX", 20),  # 20 units (BSE)
@@ -219,7 +234,7 @@ NIFTY_INDEX_TOKEN = INSTRUMENT_REGISTRY["NIFTY"].index_token
 # India VIX token — resolved at runtime via searchScrip if the
 # hardcoded token is rejected (Angel One changed their scrip master).
 # Hardcoded value kept as first attempt; fallback searches for it.
-INDIA_VIX_TOKEN   = "99919000"    # may be stale — see _resolve_vix_token()
+INDIA_VIX_TOKEN   = "99926017"    # India VIX per Angel One scrip master (99919000 was wrong)
 _vix_token_resolved: str | None = None
 
 
@@ -316,14 +331,12 @@ def get_symbol_token(symbol: str, exchange: str = NSE_FO) -> str:
             # AB4047: scrip not in session's scrip master cache
             # Force re-login to refresh the instrument master, then retry
             errorcode = resp.get("errorcode", "")
-            if errorcode == "AB4047" and attempt == 1:
+            if errorcode == "AB4047":
                 logger.warning(
-                    f"AB4047 for {symbol} — scrip master stale, refreshing session..."
+                    f"AB4047 for {symbol} — symbol not available in Angel One "
+                    f"scrip master. Re-login will not be retried."
                 )
-                from session_manager import SessionManager
-                SessionManager.get()._relogin()
-                smart = auth.get_session()   # get fresh session after re-login
-                continue   # retry with fresh session
+                break
 
             # Any other non-status response — stop
             logger.error(f"searchScrip failed for {symbol}: {resp.get('message')}")
@@ -456,42 +469,62 @@ def get_ohlc_candles(
     # up to 90s and freezes all logging. If rate-limited, wait once (20s)
     # then retry. If still failing, raise so the caller can use cached data.
     resp = None
-    for attempt in range(1, 3):   # max 2 attempts: normal + one retry
-        try:
-            with _API_LOCK:
-                _api_throttle(delay=_CANDLE_CALL_DELAY)
-                raw = smart.getCandleData(params)
-        except Exception as lib_exc:
-            err_str = str(lib_exc).lower()
-            is_rate_limit = any(x in err_str for x in [
-                "access rate", "too many", "couldn't parse", "parse the json",
-                "ab1021", "ab1010",
-            ])
-            if is_rate_limit and attempt == 1:
-                logger.warning(
-                    f"[Rate limit] getCandleData for {symbol} — waiting 20s then retrying. "
-                    f"Error: {lib_exc}"
-                )
-                time.sleep(20)
-                continue   # one retry
+    try:
+        with _API_LOCK:
+            _api_throttle(delay=_CANDLE_CALL_DELAY)
+            raw = smart.getCandleData(params)
+    except Exception as lib_exc:
+        err_str = str(lib_exc).lower()
+
+        is_rate_limit = any(x in err_str for x in [
+            "access rate",
+            "too many",
+            "couldn't parse",
+            "parse the json",
+            "ab1021",
+            "ab1010",
+        ])
+
+        if is_rate_limit:
+            logger.warning(
+                f"[Rate limit] getCandleData for {symbol} — "
+                f"NOT retrying immediately. "
+                f"Cached candles will be used if available."
+            )
             raise RuntimeError(
-                f"getCandleData {'rate-limited' if is_rate_limit else 'failed'} "
-                f"for {symbol}: {lib_exc}"
+                f"getCandleData rate-limited for {symbol}: {lib_exc}"
             )
 
-        # getCandleData returned — check for raw bytes (older SmartAPI versions)
-        if isinstance(raw, (bytes, str)):
-            body = raw if isinstance(raw, str) else raw.decode("utf-8", errors="ignore")
-            if ("access rate" in body.lower() or "too many" in body.lower()) and attempt == 1:
-                logger.warning(
-                    f"[Rate limit bytes] getCandleData for {symbol} — waiting 20s then retrying"
-                )
-                time.sleep(20)
-                continue
-            raise RuntimeError(f"Couldn't parse candle response for {symbol}: {body[:80]}")
+        raise RuntimeError(
+            f"getCandleData failed for {symbol}: {lib_exc}"
+        )
 
-        resp = raw
-        break  # clean dict response — done
+        # SmartAPI may return a raw bytes/string body when Angel One
+        # responds with a non-JSON rate-limit page.
+    if isinstance(raw, (bytes, str)):
+        body = (
+            raw
+            if isinstance(raw, str)
+            else raw.decode("utf-8", errors="ignore")
+        )
+        if any(x in body.lower() for x in [
+            "access rate",
+            "too many",
+            "ab1021",
+            "ab1010",
+        ]):
+            logger.warning(
+                f"[Rate limit] getCandleData for {symbol} — "
+                f"server rejected request; no immediate retry."
+            )
+            raise RuntimeError(
+                f"getCandleData rate-limited for {symbol}"
+            )
+        raise RuntimeError(
+            f"Couldn't parse candle response for {symbol}: {body[:120]}"
+        )
+
+    resp = raw
 
     # status=True but data=None → market just opened, no candles yet
     # Raise a clear, specific error so callers can skip this tick gracefully
@@ -546,8 +579,16 @@ def get_index_candles(
         with _CANDLE_CACHE_LOCK:
             if cache_key in _CANDLE_CACHE:
                 fetched_at, cached_df = _CANDLE_CACHE[cache_key]
-                if time.time() - fetched_at < _CANDLE_TTL:
-                    return cached_df  # fresh enough — skip the API call
+                # Candle-aligned freshness: the cache is good until the NEXT candle
+                # closes. Fetched after the latest boundary (+ settle time) means it
+                # already contains the most recent completed candle.
+                step = _INTERVAL_SECS.get(interval)
+                if step:
+                    boundary = (time.time() // step) * step
+                    if fetched_at >= boundary + config.CANDLE_SETTLE_SECS:
+                        return cached_df
+                elif time.time() - fetched_at < _CANDLE_TTL:
+                    return cached_df  # unknown interval: fall back to the fixed TTL
 
     inst = get_instrument(instrument_name)
     try:
@@ -559,19 +600,32 @@ def get_index_candles(
             lookback_days=lookback_days,
         )
     except RuntimeError as exc:
-        # On rate-limit: serve stale cache if available rather than crashing the tick.
-        # Stale candles are better than no candles — indicators still work, just
-        # slightly behind. The tick continues and next poll will get fresh data.
-        if "rate-limited" in str(exc).lower() or "rate limit" in str(exc).lower():
+        error_text = str(exc).lower()
+    
+        if "rate-limited" in error_text or "rate limit" in error_text:
             with _CANDLE_CACHE_LOCK:
-                if cache_key in _CANDLE_CACHE:
-                    _, stale_df = _CANDLE_CACHE[cache_key]
-                    logger.warning(
-                        f"[{instrument_name}] getCandleData rate-limited — "
-                        f"serving stale candles from cache. Bot continues."
-                    )
-                    return stale_df
-        raise   # no cache — propagate so tick is skipped cleanly
+                cached = _CANDLE_CACHE.get(cache_key)
+    
+            if cached is not None:
+                fetched_at, stale_df = cached
+                age = time.time() - fetched_at
+    
+                logger.warning(
+                    f"[{instrument_name}] getCandleData rate-limited — "
+                    f"using cached candles "
+                    f"(age={age:.0f}s)."
+                )
+    
+                return stale_df
+    
+            logger.error(
+                f"[{instrument_name}] getCandleData rate-limited and "
+                f"no cached candles are available."
+            )
+    
+        raise
+
+  # no cache — propagate so tick is skipped cleanly
 
     with _CANDLE_CACHE_LOCK:
         _CANDLE_CACHE[cache_key] = (time.time(), df)
@@ -630,50 +684,187 @@ def _last_weekday_of_month(year: int, month: int, weekday: int) -> "date":
     return last_date - timedelta(days=delta)
 
 
-def get_expiry_string(instrument_name: str) -> str:
+_SCRIP_MASTER_URL = ("https://margincalculator.angelbroking.com/"
+                     "OpenAPI_File/files/OpenAPIScripMaster.json")
+_EXPIRY_CACHE_PATH = os.path.join(config.DATA_DIR, "expiries.json")
+_EXPIRY_CACHE: dict = {}      # {"date": "YYYY-MM-DD", "expiries": {"NFO:NIFTY": ["2026-10-13", ...]}}
+
+
+def _download_scrip_master(retries: int = 3) -> list:
     """
-    Build the Angel One expiry string for any instrument.
-
-    Angel One uses YYMON format (no day) for ALL option symbols —
-    both weekly and monthly. The distinction only affects which
-    contract month is selected, not the string format.
-
-    Weekly instruments  → nearest upcoming expiry_weekday month
-                          format: YYMON  e.g. "25SEP"  → NIFTY25SEP23350CE
-    Monthly instruments → last occurrence of expiry_weekday in the
-                          current contract month (rolls to next month
-                          if today is past that date)
-                          format: YYMON  e.g. "25JUL"
-
-    Current schedule (2025-26):
-      NIFTY     → Tuesday  weekly   → "26SEP"
-      SENSEX    → Thursday weekly   → "26SEP"
-      BANKNIFTY → last Tue monthly  → "26SEP"
-      BANKEX    → last Thu monthly  → "26SEP"
-      FINNIFTY  → last Tue monthly  → "26SEP"
+    Fetch the ~35 MB scrip master to a temp file (so a dropped connection can't leave us with
+    half a JSON document), retrying a few times — Angel One's file server is sometimes slow.
     """
-    inst = get_instrument(instrument_name)
-    now  = datetime.now()
+    import json
+    import tempfile
+    import requests
+    last: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        path = None
+        try:
+            with requests.get(_SCRIP_MASTER_URL, stream=True, timeout=(10, 45)) as resp:
+                resp.raise_for_status()
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+                    path = tmp.name
+                    for chunk in resp.iter_content(1 << 20):
+                        tmp.write(chunk)
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)                     # raises if the download was cut short
+        except Exception as exc:
+            last = exc
+            logger.warning(f"Scrip master download attempt {attempt}/{retries} failed: {exc}")
+            time.sleep(3 * attempt)
+        finally:
+            if path and os.path.exists(path):
+                os.remove(path)
+    raise RuntimeError(f"scrip master download failed after {retries} attempts: {last}")
 
+
+def _load_scrip_master_tables() -> tuple[dict[str, list[str]], dict]:
+    """
+    Download Angel One's public scrip master and keep two small summaries:
+      * every option expiry date per "<fo_exchange>:<underlying>"
+      * the exact (symbol, token) of every option contract of the registry's
+        instruments for their nearest three expiries, keyed "<strike><CE|PE>".
+    Reading symbols from the master (instead of building them) matters because
+    exchanges format them differently — NFO: NIFTY13OCT2622450PE, but BFO weekly:
+    SENSEX26O1582200CE — and it avoids rate-limited searchScrip calls.
+    """
+    master = _download_scrip_master()
+    ours = set(INSTRUMENT_REGISTRY)
+    today = datetime.now().date().isoformat()
+    found: dict[str, set[str]] = {}
+    rows: dict[str, list] = {}
+    for row in master:
+        if row.get("instrumenttype") != "OPTIDX" or not row.get("expiry"):
+            continue
+        d = datetime.strptime(row["expiry"], "%d%b%Y").date().isoformat()
+        key = f"{row['exch_seg']}:{row['name']}"
+        found.setdefault(key, set()).add(d)
+        if row["name"] in ours:
+            rows.setdefault(key, []).append((d, row))
+    contracts: dict = {}
+    for key, items in rows.items():
+        keep = set(sorted({d for d, _ in items if d >= today})[:3])
+        table = contracts.setdefault(key, {})
+        for d, row in items:
+            if d in keep:
+                strike = int(round(float(row["strike"]) / 100))
+                kind = "CE" if row["symbol"].endswith("CE") else "PE"
+                table.setdefault(d, {})[f"{strike}{kind}"] = [row["symbol"], row["token"]]
+    return {k: sorted(v) for k, v in found.items()}, contracts
+
+
+_TABLE_RETRY_SECS = 600            # after a failed download, wait this long before trying again
+_table_next_try   = 0.0
+_table_thread: Optional["_threading.Thread"] = None
+
+
+def _table_refresh_worker() -> None:
+    """Background download of today's expiry/contract tables (never blocks the trading loop)."""
+    import json
+    global _table_next_try
+    today = datetime.now().date().isoformat()
+    try:
+        expiries, contracts = _load_scrip_master_tables()
+        data = {"date": today, "expiries": expiries, "contracts": contracts}
+        with open(_EXPIRY_CACHE_PATH, "w") as f:
+            json.dump(data, f)
+        _EXPIRY_CACHE.clear()
+        _EXPIRY_CACHE.update(data)
+        logger.info("📅 Option expiries + contracts refreshed from Angel One scrip master")
+    except Exception as exc:
+        _table_next_try = time.monotonic() + _TABLE_RETRY_SECS
+        have = _EXPIRY_CACHE.get("date")
+        logger.warning(
+            f"Scrip master refresh failed: {exc} — "
+            + (f"using the saved table from {have}" if have else "using calendar fallback")
+            + f"; retrying in {_TABLE_RETRY_SECS // 60} min")
+
+
+def refresh_tables(wait: bool = False, timeout: float = 300.0) -> None:
+    """
+    Make sure today's expiry/contract tables are loaded. Loads the saved file immediately
+    (fast) and starts a background download if the saved copy is not from today.
+    With wait=True, blocks until that download finishes (startup / tests only).
+    """
+    import json
+    global _table_thread
+    today = datetime.now().date().isoformat()
+    if not _EXPIRY_CACHE:
+        try:
+            with open(_EXPIRY_CACHE_PATH) as f:
+                _EXPIRY_CACHE.update(json.load(f))
+        except Exception:
+            pass
+    stale = _EXPIRY_CACHE.get("date") != today or "contracts" not in _EXPIRY_CACHE
+    running = _table_thread is not None and _table_thread.is_alive()
+    if stale and not running and time.monotonic() >= _table_next_try:
+        _table_thread = _threading.Thread(target=_table_refresh_worker, name="scrip-master", daemon=True)
+        _table_thread.start()
+        running = True
+    if wait and running and _table_thread is not None:
+        _table_thread.join(timeout)
+
+
+def _get_listed_expiries(inst: "InstrumentConfig") -> list:
+    """
+    Real listed expiry dates for an instrument (holiday shifts included), from the scrip
+    master. Uses the saved table while a fresh one downloads in the background.
+    Returns [] if nothing is available yet (callers fall back to the calendar rule).
+    """
+    from datetime import date as _date
+    refresh_tables()
+    dates = _EXPIRY_CACHE.get("expiries", {}).get(f"{inst.fo_exchange}:{inst.name}", [])
+    return [_date.fromisoformat(d) for d in dates]
+
+
+def _next_expiry_date(inst: "InstrumentConfig") -> "date":
+    """
+    The expiry the bot trades: the nearest listed expiry AFTER today, read from the
+    scrip master so exchange holiday shifts (e.g. a Tuesday expiry moved to Monday)
+    are respected. If the scrip master is unreachable, it falls back to the calendar
+    rule: next expiry_weekday (weekly) or last expiry_weekday of the month (monthly).
+    """
+    today = datetime.now().date()
+
+    upcoming = [d for d in _get_listed_expiries(inst) if d > today]
+    if upcoming:
+        return min(upcoming)
+
+    # ── Calendar fallback ─────────────────────────────────────
     if inst.expiry_type == "weekly":
-        target_dow = inst.expiry_weekday
-        days_ahead = (target_dow - now.weekday()) % 7
+        days_ahead = (inst.expiry_weekday - today.weekday()) % 7
         if days_ahead == 0:
             days_ahead = 7          # already on expiry day → use next week's
-        expiry_dt = now + timedelta(days=days_ahead)
-        return expiry_dt.strftime("%y%b").upper()   # YYMON only — no day component
+        return today + timedelta(days=days_ahead)
+    # monthly — last occurrence of expiry_weekday in month
+    expiry_dt = _last_weekday_of_month(today.year, today.month, inst.expiry_weekday)
+    if today >= expiry_dt:          # past this month's expiry → next month's
+        year, month = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+        expiry_dt = _last_weekday_of_month(year, month, inst.expiry_weekday)
+    return expiry_dt
 
-    else:  # monthly — last occurrence of expiry_weekday in month
-        last_exp = _last_weekday_of_month(now.year, now.month, inst.expiry_weekday)
-        # if today is on or past the last expiry, roll to next month
-        if now.date() >= last_exp:
-            # advance to the 1st of next month then find last weekday there
-            if now.month == 12:
-                next_year, next_month = now.year + 1, 1
-            else:
-                next_year, next_month = now.year, now.month + 1
-            last_exp = _last_weekday_of_month(next_year, next_month, inst.expiry_weekday)
-        return last_exp.strftime("%y%b").upper()
+
+def get_expiry_string(instrument_name: str) -> str:
+    """
+    Expiry as DDMMMYY (e.g. "13OCT26") — the NFO symbol style:
+    NIFTY13OCT2622450PE = NIFTY + 13OCT26 + 22450 + PE. (BFO/SENSEX symbols use a
+    different style; use find_contract() instead of building symbols by hand.)
+    """
+    return _next_expiry_date(get_instrument(instrument_name)).strftime("%d%b%y").upper()
+
+
+def find_contract(instrument_name: str, strike: int, option_type: str) -> Optional[tuple[str, str]]:
+    """
+    Exact (trading symbol, token) of an option contract for the traded expiry, taken from
+    the scrip master. Returns None if it isn't listed (caller falls back to searchScrip).
+    """
+    inst = get_instrument(instrument_name)
+    expiry = _next_expiry_date(inst)               # also makes sure today's tables are loaded
+    table = _EXPIRY_CACHE.get("contracts", {}).get(f"{inst.fo_exchange}:{inst.name}", {})
+    hit = table.get(expiry.isoformat(), {}).get(f"{int(strike)}{option_type}")
+    return (hit[0], hit[1]) if hit else None
 
 
 def build_option_symbol(
@@ -683,15 +874,15 @@ def build_option_symbol(
     option_type: str
 ) -> str:
     """
-    Build the Angel One NSE option trading symbol string.
+    Build the Angel One option trading symbol string.
 
     Args:
         underlying:  "NIFTY"
-        expiry:      "23SEP"  (format: YYMonthDD for weekly, or YYMON for monthly)
-        strike:      19850
+        expiry:      "13OCT26"  (DDMMMYY, from get_expiry_string())
+        strike:      22450
         option_type: "CE" or "PE"
 
-    Returns: "NIFTY23SEP1985CE"  (example)
+    Returns: "NIFTY13OCT2622450PE"  (example)
     """
     return f"{underlying}{expiry}{strike}{option_type}"
 
